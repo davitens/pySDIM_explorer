@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pysdim-explorer"
-version = "0.1.0"
+version = "0.2.0"
 description = "Map-based GUI to download ACA SDIM water data with pySDIM"
 readme = "README.md"
 license = "MIT"

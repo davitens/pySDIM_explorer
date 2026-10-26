@@ -25,6 +25,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import pandas as pd
+
 from sdim import SDIM, Catalog, Query, SDIMError, SDIMNoData
 from sdim.catalog import _norm
 from sdim.resolver import (
@@ -33,6 +35,11 @@ from sdim.resolver import (
 STATIC = Path(__file__).resolve().parent / "static"
 DEFAULT_OUT = Path.cwd() / "sdim_downloads"
 SHEETS = {"quality": "qualitat", "quantity": "quantitat"}
+# SDIM keeps data before 2007 in a separate archive: each period is its own
+# target, queried over its part of the requested dates and merged afterwards
+PERIODS = ("before_2007", "after_2007")
+PERIOD_SPAN = {"before_2007": (None, "2006-12-31"), "after_2007": ("2007-01-01", None)}
+PERIOD_LABELS = {"before_2007": "abans del 2007", "after_2007": "des del 2007"}
 OTHER = "_other"  # prefix of pseudo-parameters for series matching no catalog parameter
 
 # labels shown in the (Catalan) interface
@@ -100,7 +107,8 @@ def sources() -> dict:
     for source, types in DATA_SOURCES.items():
         out.append({
             "id": source, "label": LABELS.get(source, source),
-            "data_types": [{"id": t, "label": LABELS.get(t, t), "periods": sorted(per)}
+            "data_types": [{"id": t, "label": LABELS.get(t, t),
+                            "periods": [p for p in PERIODS if p in per]}
                            for t, per in types.items()],
         })
     zones = [{"id": z, "label": LABELS.get(z, z), "subnetwork": s}
@@ -172,6 +180,59 @@ def target_info(source: str, dtype: str, period: str, zone: str | None) -> dict:
     }
 
 
+def _zone_of(target_id: str) -> str | None:
+    sub = target_id.split(":")[2]
+    return next((z for z, s in PROTECTED_ZONES.items() if s == sub), None)
+
+
+@functools.lru_cache(maxsize=32)
+def type_info(source: str, dtype: str, zone: str | None) -> dict:
+    """One data type over both periods: its targets, its parameters merged by
+    SDIM parameter code (shared by both periods) and its stations merged by
+    station code. Station series are ``[period, series id, name, parameter]``."""
+    parts: dict[str, dict] = {}
+    for period in ("after_2007", "before_2007"):
+        if period not in DATA_SOURCES[source][dtype]:
+            continue
+        z = zone
+        if source == "protected" and not z and "after_2007" in parts:
+            z = _zone_of(parts["after_2007"]["target_id"])  # same zone in both periods
+        try:
+            parts[period] = target_info(source, dtype, period, z)
+        except SDIMError:
+            continue  # e.g. a protected zone without pre-2007 data
+    if not parts:
+        raise SDIMError("SDIM no té dades d'aquest tipus.")
+
+    variables: dict[str, dict] = {}
+    counts: dict[str, int] = {}
+    stations: dict[str, dict] = {}
+    for period, info in parts.items():
+        for v in info["variables"]:
+            variables.setdefault(v["v"], {**v, "periods": []})["periods"].append(period)
+        for v, n in info["series_counts"].items():
+            counts[v] = counts.get(v, 0) + n
+        for st in info["stations"]:
+            m = stations.get(st["code"])
+            if m is None:
+                m = stations[st["code"]] = {**st, "series": [], "periods": []}
+            elif m["lat"] is None and st["lat"] is not None:
+                m.update(lat=st["lat"], lon=st["lon"], x=st["x"], y=st["y"])
+            m["periods"].append(period)
+            m["series"] += [[period, *s] for s in st["series"]]
+    others = sorted((v for v in variables.values() if v["v"].startswith(OTHER)),
+                    key=lambda v: v["v"])
+    return {
+        "source": source, "data_type": dtype, "label": LABELS.get(dtype, dtype),
+        "targets": [{"period": p, "target_id": i["target_id"], "groups": i["groups"],
+                     "network_name": i["network_name"], "subnetwork_name": i["subnetwork_name"],
+                     "stations": len(i["stations"])} for p, i in parts.items()],
+        "variables": [v for v in variables.values() if not v["v"].startswith(OTHER)] + others,
+        "series_counts": counts,
+        "stations": list(stations.values()),
+    }
+
+
 # -- downloads -----------------------------------------------------------------
 
 class LoggingSDIM(SDIM):
@@ -193,8 +254,9 @@ class LoggingSDIM(SDIM):
 
 
 def build_query(part: dict, start: str, end: str) -> Query:
-    """Query for one data type: its stations, their series and the kinds of
-    the chosen parameters (all kinds when per-station series are included)."""
+    """Query for one data type in one period: its stations, their series and
+    the kinds of the chosen parameters (all kinds when per-station series are
+    included)."""
     period, net, sub = part["target_id"].split(":")
     stations = {code: ids for code, ids in part["stations"].items() if ids}
     tv = catalog.variables_for(net, sub, period=period)
@@ -208,61 +270,144 @@ def build_query(part: dict, start: str, end: str) -> Query:
                  ambit="catalunya", stations=stations, start=start, end=end)
 
 
+def clip_dates(period: str, start: str, end: str) -> tuple[str, str] | None:
+    """The part of ``start``..``end`` (ISO dates) that falls in ``period``."""
+    lo, hi = PERIOD_SPAN[period]
+    s, e = max(start, lo) if lo else start, min(end, hi) if hi else end
+    return (s, e) if s <= e else None
+
+
+def parameter_name(variable) -> str:
+    """Column name of an SDIM series. Series names are the same in both
+    periods, so they merge the periods without mixing field and lab series
+    of one parameter. Station-prefixed names keep only what is measured:
+    ``E06_Vilanova Sau_Sau_Cabal sortida`` -> ``Cabal sortida``,
+    ``08001-0039_Abrera_AB2_Nivell piezometric_Manual`` -> ``Nivell piezometric Manual``."""
+    if pd.isna(variable):
+        return variable
+    parts = str(variable).split("_")
+    if len(parts) == 1:
+        return parts[0].strip()
+    tail = parts[-1].strip()
+    if " " not in tail and len(parts) > 2:
+        tail = f"{parts[-2].strip()} {tail}"
+    return tail
+
+
+def add_parameter(df: pd.DataFrame, period: str) -> pd.DataFrame:
+    """Add ``period`` and ``parameter`` (see :func:`parameter_name`)."""
+    df = df.copy()
+    df.insert(df.columns.get_loc("variable"), "parameter", df["variable"].map(parameter_name))
+    df.insert(0, "period", period)
+    return df
+
+
+def wide_table(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per station and date, one column per parameter (and unit):
+    values from both periods land in the same column."""
+    d = df.dropna(subset=["value"]).copy()
+    if d.empty:
+        return pd.DataFrame()
+    d["column"] = d["parameter"].astype(str)
+    if "unit" in d:
+        # units written differently ("mg/l", "mg/L") share a column
+        unit = d["unit"].fillna("").astype(str).str.strip()
+        first: dict[str, str] = {}
+        for k, u in zip(unit.str.lower(), unit):
+            first.setdefault(k, u)
+        shown = unit.str.lower().map(first)
+        d["column"] = d["column"].where(shown == "", d["column"] + " (" + shown + ")")
+    d["station_name"] = d["station_name"].fillna("") if "station_name" in d else ""
+    w = d.pivot_table(index=["station_code", "station_name", "date"], columns="column",
+                      values="value", aggfunc="mean")
+    w.columns.name = None
+    return w.reset_index()
+
+
 def run_job(job: dict, req: dict) -> None:
-    """Download every selected data type (one SDIM target each) and save them
-    side by side, plus one ZIP with everything."""
+    """Download every selected data type in each period it has data for,
+    merge the periods and save one long and one wide CSV per data type and
+    sheet, a provenance JSON per data type and a ZIP with everything."""
     def log(msg):
         job["log"].append(msg)
 
-    parts = [p for p in req.get("targets", []) if any(p["stations"].values())]
+    types = [t for t in req.get("types", [])
+             if any(any(p["stations"].values()) for p in t["parts"])]
     out_dir = Path(req.get("out_dir") or DEFAULT_OUT).expanduser()
     prefix = req.get("prefix") or f"sdim_{date.today():%Y%m%d}"
     job.update(files=[], summary=[], preview={}, out_dir=str(out_dir))
     failed = 0
     try:
-        if not parts:
+        if not types:
             raise SDIMError("No s'ha seleccionat cap sèrie d'estació.")
+        out_dir.mkdir(parents=True, exist_ok=True)
         aca = LoggingSDIM(log, delay=float(req.get("delay", 0.6)))
         try:
-            for part in parts:
-                label = part.get("label") or part["target_id"]
-                query = build_query(part, req["start"], req["end"])
-                n_series = sum(len(v) for v in query.stations.values())
-                log(f"— {label} ({part['target_id']}): {len(query.stations)} estació(ns), "
-                    f"{n_series} sèries")
-                try:
-                    with warnings.catch_warnings(record=True) as caught:
-                        warnings.simplefilter("always")
-                        result = aca.get_data(query, max_requests=int(req.get("max_requests", 64)))
-                    for w in caught:
-                        log(f"Avís: {w.message}")
-                except SDIMNoData:
-                    log("Sense dades per a aquest tipus.")
-                    continue
-                except Exception as exc:  # keep going with the other data types
-                    failed += 1
-                    log(f"Error: {exc}")
-                    job["trace"] = traceback.format_exc()
-                    continue
-                name = f"{prefix}_{part['target_id'].replace(':', '_')}"
-                job["files"] += [str(p) for p in result.save(out_dir / name)]
-                for sheet, df in result.items():
-                    if not len(df):
+            for t in types:
+                info = type_info(t["source"], t["data_type"], t.get("zone") or None)
+                label = info["label"]
+                sheets: dict[str, list[pd.DataFrame]] = {}
+                prov = []
+                for part in t["parts"]:
+                    period = part["target_id"].split(":")[0]
+                    span = clip_dates(period, req["start"], req["end"])
+                    if span is None or not any(part["stations"].values()):
                         continue
+                    query = build_query(part, *span)
+                    n_series = sum(len(v) for v in query.stations.values())
+                    log(f"— {label}, {PERIOD_LABELS[period]} ({part['target_id']}): "
+                        f"{len(query.stations)} estació(ns), {n_series} sèries, {span[0]} → {span[1]}")
+                    try:
+                        with warnings.catch_warnings(record=True) as caught:
+                            warnings.simplefilter("always")
+                            result = aca.get_data(query, max_requests=int(req.get("max_requests", 64)))
+                        for w in caught:
+                            log(f"Avís: {w.message}")
+                    except SDIMNoData:
+                        log("Sense dades en aquest període.")
+                        continue
+                    except Exception as exc:  # keep going with the other parts
+                        failed += 1
+                        log(f"Error: {exc}")
+                        job["trace"] = traceback.format_exc()
+                        continue
+                    prov.append(result.provenance)
+                    for sheet, df in result.items():
+                        if len(df):
+                            sheets.setdefault(sheet, []).append(add_parameter(df, period))
+                if not sheets:
+                    continue
+                key = f"{t['source']}_{t['data_type']}"
+                for sheet, frames in sheets.items():
+                    df = pd.concat(frames, ignore_index=True)
+                    df = df.sort_values([c for c in ("station_code", "parameter", "date")
+                                         if c in df.columns], kind="stable")
+                    long_path = out_dir / f"{prefix}_{key}_{sheet}.csv"
+                    df.to_csv(long_path, index=False)
+                    wide = wide_table(df)
+                    wide_path = out_dir / f"{prefix}_{key}_{sheet}_wide.csv"
+                    wide.to_csv(wide_path, index=False)
+                    job["files"] += [str(long_path), str(wide_path)]
                     job["summary"].append({
                         "label": label, "sheet": sheet, "rows": len(df),
                         "stations": int(df["station_code"].nunique()),
-                        "variables": int(df["variable"].nunique()),
+                        "parameters": int(df["parameter"].nunique()),
+                        "periods": [PERIOD_LABELS[p] for p in PERIODS if p in set(df["period"])],
                         "first": str(df["date"].min())[:10], "last": str(df["date"].max())[:10],
                     })
-                    cols = [c for c in ("date", "station_code", "station_name", "variable",
+                    cols = [c for c in ("period", "date", "station_code", "station_name", "parameter",
                                         "value", "qualifier", "unit") if c in df.columns]
                     head = df[cols].head(100)
                     job["preview"][f"{label} · {SHEETS.get(sheet, sheet)}"] = {
                         "columns": cols,
                         "rows": head.astype(object).where(head.notna(), "").astype(str).values.tolist(),
                     }
-                    log(f"{SHEETS.get(sheet, sheet)}: {len(df)} files")
+                    n_cols = len(wide.columns) - 3 if len(wide) else 0
+                    log(f"{label} · {SHEETS.get(sheet, sheet)}: {len(df)} files, "
+                        f"{n_cols} columnes de paràmetres")
+                prov_path = out_dir / f"{prefix}_{key}_provenance.json"
+                prov_path.write_text(json.dumps(prov, indent=2, ensure_ascii=False), encoding="utf-8")
+                job["files"].append(str(prov_path))
         finally:
             aca.close()
 
@@ -308,8 +453,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send((STATIC / "index.html").read_bytes(), "text/html; charset=utf-8")
             elif url.path == "/api/sources":
                 self._json({**sources(), "default_out": str(DEFAULT_OUT)})
-            elif url.path == "/api/target":
-                self._json(target_info(q["source"], q["data_type"], q["period"], q.get("zone")))
+            elif url.path == "/api/type":
+                self._json(type_info(q["source"], q["data_type"], q.get("zone") or None))
             elif url.path == "/api/job":
                 job = jobs.get(q.get("id", ""))
                 if job is None:

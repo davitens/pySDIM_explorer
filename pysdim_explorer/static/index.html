@@ -51,6 +51,8 @@
   details.dtype > summary .n { font-weight: 400; }
   .ptree { max-height: 320px; overflow-y: auto; padding: 4px 0; border-top: 1px solid var(--border); }
   .ptree .loading, .ptree .tmeta { padding: 4px 12px; color: var(--muted); font-size: 12px; }
+  .tag { font-size: 10px; color: var(--muted); border: 1px solid var(--border); border-radius: 4px;
+         padding: 0 4px; font-weight: 400; white-space: nowrap; }
   .ptree details { padding: 0 8px; } .ptree details details { padding-left: 16px; }
   summary { cursor: pointer; padding: 2px 0; list-style: none; display: flex; align-items: center; gap: 5px; }
   summary::-webkit-details-marker { display: none; }
@@ -107,14 +109,10 @@
 
   <section>
     <h2>1 · Font de dades</h2>
-    <div style="margin-bottom:8px">
-      <span class="seg" id="period">
-        <button data-p="after_2007" class="on">Des del 2007</button>
-        <button data-p="before_2007">Abans del 2007</button>
-      </span>
-    </div>
     <label class="field">Origen de l'aigua <select id="source"></select></label>
     <label class="field hidden" id="zoneWrap">Zona protegida <select id="zone"></select></label>
+    <div class="meta">Les dades d'abans i des del 2007 es baixen juntes: cada paràmetre
+      queda en una sola columna al fitxer de sortida.</div>
   </section>
 
   <section>
@@ -179,8 +177,9 @@
 
 <script>
 const $ = s => document.querySelector(s);
-// types: data type id -> { label, target, params: Set of parameter ids } for every ticked type
-const state = { period: "after_2007", sources: [], zones: [], types: new Map(), stations: new Map(),
+// types: data type id -> { label, info, params: Set of parameter ids } for every ticked type;
+// info covers both periods (before and since 2007), merged by the server
+const state = { sources: [], zones: [], types: new Map(), stations: new Map(),
                 selected: new Set(), tool: "click", op: "add", job: null };
 const markers = new Map();   // station code -> circle marker
 const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -199,13 +198,15 @@ L.control.layers({ "OpenStreetMap": osm, "Topogràfic": topo, "Satèl·lit": sat
   { position: "topright" }).addTo(map);
 const layer = L.layerGroup().addTo(map);
 
-// series of a station with the chosen parameters, over every ticked data type: [type, id, name]
+const PERIODS = { before_2007: "abans del 2007", after_2007: "des del 2007" };
+// series of a station with the chosen parameters, over every ticked data type:
+// [type, period, id, name] (server series are [period, id, name, parameter])
 function stationSeries(st) {
   const out = [];
   for (const [dt, series] of Object.entries(st.per)) {
     const t = state.types.get(dt);
     if (!t) continue;
-    for (const s of series) if (t.params.has(s[2])) out.push([dt, s[0], s[1]]);
+    for (const s of series) if (t.params.has(s[3])) out.push([dt, s[0], s[1], s[2]]);
   }
   return out;
 }
@@ -221,12 +222,13 @@ function styleFor(st) {
 function rebuildStations() {
   state.stations = new Map();
   for (const [dt, t] of state.types) {
-    if (!t.target) continue;
-    for (const s of t.target.stations) {
+    if (!t.info) continue;
+    for (const s of t.info.stations) {
       let st = state.stations.get(s.code);
       if (!st) state.stations.set(s.code, st = { code: s.code, name: s.name, lat: s.lat, lon: s.lon,
-                                                 x: s.x, y: s.y, per: {} });
+                                                 x: s.x, y: s.y, per: {}, periods: new Set() });
       st.per[dt] = s.series;
+      s.periods.forEach(p => st.periods.add(p));
     }
   }
   drawMarkers();
@@ -259,9 +261,12 @@ function popupHtml(st) {
   const byType = Object.keys(st.per).map(dt => {
     const t = state.types.get(dt), items = sel.filter(s => s[0] === dt);
     return `<div style="margin-top:4px"><b>${esc(t ? t.label : dt)}</b>: ${items.length} de ${st.per[dt].length} sèries
-      ${items.length ? `<ul style="padding-left:16px;margin:2px 0">${items.map(s => `<li>${esc(s[2])}</li>`).join("")}</ul>` : ""}</div>`;
+      ${items.length ? `<ul style="padding-left:16px;margin:2px 0">${items.map(s =>
+        `<li>${esc(s[3])} <span class="tag">${PERIODS[s[1]]}</span></li>`).join("")}</ul>` : ""}</div>`;
   }).join("");
-  return `<b>${esc(st.name)}</b><br><code>${esc(st.code)}</code> · UTM ${esc(st.x)}, ${esc(st.y)}${byType}`;
+  const periods = Object.keys(PERIODS).filter(p => st.periods.has(p)).map(p => PERIODS[p]).join(" i ");
+  return `<b>${esc(st.name)}</b><br><code>${esc(st.code)}</code> · UTM ${esc(st.x)}, ${esc(st.y)}
+    <br><span style="color:#677085">Dades ${periods}</span>${byType}`;
 }
 function restyle() {
   const showOff = $("#showOff").checked;
@@ -345,7 +350,7 @@ async function api(path, opts) {
   return j;
 }
 function fillSources() {
-  const avail = state.sources.filter(s => s.data_types.some(t => t.periods.includes(state.period)));
+  const avail = state.sources;
   const prev = $("#source").value;
   $("#source").innerHTML = avail.map(s => `<option value="${s.id}">${esc(s.label)}</option>`).join("");
   if (avail.some(s => s.id === prev)) $("#source").value = prev;
@@ -353,12 +358,13 @@ function fillSources() {
 }
 function fillTypes() {
   const src = state.sources.find(s => s.id === $("#source").value);
-  const types = src.data_types.filter(t => t.periods.includes(state.period));
+  const types = src.data_types;
   $("#zoneWrap").classList.toggle("hidden", src.id !== "protected");
   const keep = types.filter(t => state.types.has(t.id)).map(t => t.id);
   state.types.clear(); state.selected.clear();
   $("#types").innerHTML = types.map(t => `<details class="dtype" data-t="${t.id}" data-label="${esc(t.label)}">
-      <summary><input type="checkbox" class="dtbox"> ${esc(t.label)}<span class="n"></span></summary>
+      <summary><input type="checkbox" class="dtbox"> ${esc(t.label)}
+        ${t.periods.length < 2 ? `<span class="tag">només ${PERIODS[t.periods[0]]}</span>` : ""}<span class="n"></span></summary>
       <div class="ptree"></div></details>`).join("");
   $("#types").querySelectorAll("details.dtype").forEach(d => d.addEventListener("toggle", () => {
     if (d.open && !state.types.has(d.dataset.t)) addType(d.dataset.t);  // opening a type ticks it
@@ -370,7 +376,7 @@ const typeEl = dt => $(`#types details.dtype[data-t="${dt}"]`);
 const treeOf = dt => typeEl(dt).querySelector(".ptree");
 function addType(dt) {
   const d = typeEl(dt);
-  state.types.set(dt, { label: d.dataset.label, target: null, params: new Set() });
+  state.types.set(dt, { label: d.dataset.label, info: null, params: new Set() });
   d.classList.add("active"); d.open = true; d.querySelector(".dtbox").checked = true;
   loadType(dt);
 }
@@ -382,25 +388,24 @@ function removeType(dt) {
   rebuildStations(); refresh();
 }
 function reloadTypes() { for (const dt of state.types.keys()) loadType(dt); }
-segmented("#period", "p", "period", fillSources);
 $("#source").addEventListener("change", fillTypes);
 $("#zone").addEventListener("change", reloadTypes);
 
 async function loadType(dt) {
   const entry = state.types.get(dt);
-  const q = new URLSearchParams({ source: $("#source").value, data_type: dt, period: state.period });
+  const q = new URLSearchParams({ source: $("#source").value, data_type: dt });
   if ($("#source").value === "protected" && $("#zone").value) q.set("zone", $("#zone").value);
   treeOf(dt).innerHTML = `<div class="loading">Carregant…</div>`;
   entry.loading = q.toString();
   try {
-    const t = await api("/api/target?" + q);
+    const t = await api("/api/type?" + q);
     if (state.types.get(dt) !== entry || entry.loading !== q.toString()) return;  // unticked or reloaded
-    entry.target = t;
+    entry.info = t;
     entry.params = new Set(t.variables.map(v => v.v));
     buildTree(dt); rebuildStations(); refresh();
   } catch (err) {
     if (state.types.get(dt) !== entry) return;
-    entry.target = null;
+    entry.info = null;
     treeOf(dt).innerHTML = `<div class="loading" style="color:var(--err)">${esc(err.message)}</div>`;
     rebuildStations(); refresh();
   }
@@ -408,14 +413,14 @@ async function loadType(dt) {
 
 // ---- parameter trees (one per ticked data type) -----------------------------------
 function buildTree(dt) {
-  const t = state.types.get(dt).target, counts = t.series_counts, groups = new Map();
+  const t = state.types.get(dt).info, counts = t.series_counts, groups = new Map();
   for (const v of t.variables) {
     const g = groups.get(v.g_name) || new Map(); groups.set(v.g_name, g);
     const f = g.get(v.f_name) || []; g.set(v.f_name, f); f.push(v);
   }
   const single = groups.size === 1;
-  let html = `<div class="tmeta">Objectiu SDIM <code>${esc(t.target_id)}</code> · ${esc(t.subnetwork_name)}
-    · ${t.stations.length} estacions${t.groups.length ? ` · grups: ${esc(t.groups.join(", "))}` : ""}</div>`;
+  let html = `<div class="tmeta">${t.targets.map(x => `${PERIODS[x.period]}: <code>${esc(x.target_id)}</code>
+    · ${x.stations} estacions`).join("<br>")}</div>`;
   for (const [g, fams] of groups) {
     html += `<details ${single ? "open" : ""}><summary><input type="checkbox" class="gbox"> ${esc(g)}</summary>`;
     for (const [f, vars] of fams) {
@@ -424,6 +429,7 @@ function buildTree(dt) {
       for (const v of vars.sort((a, b) => a.v_name.localeCompare(b.v_name, "ca")))
         html += `<label class="param" data-name="${esc(norm(v.v_name + " " + f + " " + g))}">
           <input type="checkbox" class="vbox" value="${esc(v.v)}" checked> ${esc(v.v_name)}
+          ${t.targets.length > 1 && v.periods.length < 2 ? `<span class="tag">només ${PERIODS[v.periods[0]]}</span>` : ""}
           <span class="n">${counts[v.v] || 0}</span></label>`;
       if (fam) html += `</details>`;
     }
@@ -439,9 +445,9 @@ function syncTree(dt) {  // parent checkbox state from children, and the count o
     box.checked = on === boxes.length && on > 0; box.indeterminate = on > 0 && on < boxes.length;
   });
   const t = state.types.get(dt);
-  if (t && t.target)
+  if (t && t.info)
     typeEl(dt).querySelector(":scope > summary .n").textContent =
-      `${t.params.size} de ${t.target.variables.length} paràmetres`;
+      `${t.params.size} de ${t.info.variables.length} paràmetres`;
 }
 $("#types").addEventListener("click", e => {
   if (e.target.matches(".gbox, .fbox")) e.stopPropagation();   // tick without folding
@@ -467,7 +473,7 @@ function setAll(on) {
   for (const dt of state.types.keys()) {
     treeOf(dt).querySelectorAll(".vbox").forEach(b => {
       if (!on || !b.closest(".param").classList.contains("hidden")) b.checked = on; });
-    if (state.types.get(dt).target) readParams(dt);
+    if (state.types.get(dt).info) readParams(dt);
   }
 }
 $("#pAll").onclick = () => setAll(true);
@@ -483,25 +489,31 @@ function applySearch(dt) {
 $("#pSearch").addEventListener("input", () => { for (const dt of state.types.keys()) applySearch(dt); });
 
 // ---- station list & summary -----------------------------------------------------
-// one download part per ticked data type: its selected stations and their series
-function chosenParts() {
-  const parts = [];
+// per ticked data type, one part per period: its target, parameters and the
+// selected stations' series; the server merges the periods
+function chosenTypes() {
+  const out = [];
   for (const [dt, t] of state.types) {
-    if (!t.target) continue;
-    const stations = {};
-    for (const code of state.selected) {
-      const st = state.stations.get(code);
-      const ids = st && st.per[dt] ? st.per[dt].filter(s => t.params.has(s[2])).map(s => s[0]) : [];
-      if (ids.length) stations[code] = ids;
-    }
-    if (Object.keys(stations).length)
-      parts.push({ target_id: t.target.target_id, label: t.label, parameters: [...t.params], stations });
+    if (!t.info) continue;
+    const parts = t.info.targets.map(x => {
+      const stations = {};
+      for (const code of state.selected) {
+        const st = state.stations.get(code);
+        const ids = st && st.per[dt]
+          ? st.per[dt].filter(s => s[0] === x.period && t.params.has(s[3])).map(s => s[1]) : [];
+        if (ids.length) stations[code] = ids;
+      }
+      const params = t.info.variables.filter(v => t.params.has(v.v) && v.periods.includes(x.period)).map(v => v.v);
+      return { target_id: x.target_id, parameters: params, stations };
+    }).filter(p => Object.keys(p.stations).length);
+    if (parts.length)
+      out.push({ source: t.info.source, data_type: dt, zone: $("#zone").value, label: t.label, parts });
   }
-  return parts;
+  return out;
 }
 function refresh() {
   restyle();
-  const parts = chosenParts(), all = [...state.stations.values()];
+  const parts = chosenTypes().flatMap(t => t.parts), all = [...state.stations.values()];
   const nSel = new Set(parts.flatMap(p => Object.keys(p.stations))).size;
   const nSeries = parts.reduce((a, p) => a + Object.values(p.stations).reduce((b, v) => b + v.length, 0), 0);
   const nAct = all.filter(active).length, noCoord = all.filter(s => s.lat == null).length;
@@ -540,7 +552,7 @@ $("#sNone").onclick = () => { state.selected.clear(); refresh(); };
 
 // ---- download -------------------------------------------------------------------
 $("#go").onclick = async () => {
-  const body = { targets: chosenParts(), start: $("#start").value, end: $("#end").value,
+  const body = { types: chosenTypes(), start: $("#start").value, end: $("#end").value,
     out_dir: $("#outDir").value.trim(), prefix: $("#prefix").value.trim(),
     max_requests: +$("#maxReq").value || 64 };
   if (!body.start || !body.end || body.start > body.end) { setStatus("Tria un interval de dates vàlid", "err"); return; }
@@ -568,7 +580,8 @@ async function poll(id) {
   setStatus(...DONE[job.state]);
   if (!job.zip) return;
   const s = job.summary.map(v =>
-    `<div><b>${esc(v.label)} · ${SHEETS[v.sheet] || v.sheet}</b>: ${fmt(v.rows)} files · ${v.stations} estacions · ${v.variables} variables · ${v.first} → ${v.last}</div>`).join("");
+    `<div><b>${esc(v.label)} · ${SHEETS[v.sheet] || v.sheet}</b>: ${fmt(v.rows)} files · ${v.stations} estacions
+      · ${v.parameters} paràmetres · ${v.first} → ${v.last} (${v.periods.join(" i ")})</div>`).join("");
   $("#results").innerHTML = `${s}<div class="meta">${job.files.map(f => esc(f)).join("<br>")}</div>
     <div class="row"><a href="/api/zip?id=${id}"><button style="width:100%">Descarrega el ZIP</button></a>
     <button id="openDir">Obre la carpeta</button></div>`;
@@ -593,7 +606,7 @@ function showPreview(preview) {
 // ---- start ----------------------------------------------------------------------
 (async () => {
   const today = new Date().toISOString().slice(0, 10);
-  $("#start").value = "2015-01-01"; $("#end").value = today;
+  $("#start").value = "2000-01-01"; $("#end").value = today;
   const s = await api("/api/sources");
   state.sources = s.sources; state.zones = s.protected_zones;
   $("#outDir").value = s.default_out;
