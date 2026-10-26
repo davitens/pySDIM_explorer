@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pysdim-explorer"
+version = "0.1.0"
+description = "Map-based GUI to download ACA SDIM water data with pySDIM"
+readme = "README.md"
+license = "MIT"
+authors = [
+    { name = "David Abert-Fernandez" },
+]
+requires-python = ">=3.10"
+keywords = ["ACA", "Catalonia", "Catalunya", "SDIM", "water quality", "hydrology", "GUI", "map"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Hydrology",
+]
+# needs pySDIM's main branch (water_source/data_type catalog), newer than 1.0.1 on PyPI
+dependencies = [
+    "pysdim @ git+https://github.com/davitens/pySDIM.git",
+]
+
+[project.scripts]
+pysdim-explorer = "pysdim_explorer.app:main"
+
+[project.urls]
+Homepage = "https://github.com/davitens/pySDIM_explorer"
+Repository = "https://github.com/davitens/pySDIM_explorer"
+pySDIM = "https://github.com/davitens/pySDIM"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pysdim_explorer*"]
+
+[tool.setuptools.package-data]
+pysdim_explorer = ["static/*"]
